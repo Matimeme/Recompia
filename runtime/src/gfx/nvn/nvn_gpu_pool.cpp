@@ -47,7 +47,7 @@ namespace gpu {
 namespace {
 
 constexpr const char* kTag = "nvn.pool";
-constexpr uint64_t kMirrorChunkBytes = 64ull << 20;   // the mirror's chunk (kChunkBytes below): import strides are a multiple of it
+constexpr uint64_t kMirrorChunkBytes = 64ull << 20;   // the mirror's chunk (mirror_chunk_bytes() below): import strides are a multiple of it
 
 VkBuffer g_dummy = VK_NULL_HANDLE;
 gfx::Buffer g_dummy_buf;
@@ -935,13 +935,13 @@ void pool_gpu_destroy(PoolGpu* p) {
 // pool itself, as before. A page written again soon after every copy (a ring buffer the game refills each frame) is "hot": it is left in
 // host memory for a while instead of faulting and being copied every frame.
 //
-// The copy is made of 64 MiB chunks, each created the first time a draw wants one of its pages, so a pool of gigabytes (Pokopia's 3.5 GiB
-// graphics heap) costs video memory only for the parts draws read. A bind that spans two chunks reads the pool.
+// The copy is split into chunks (64 MiB by default, 2..64 MiB with pool_mirror_chunk_mb). The destination
+// allocation is deferred until pages actually need copying, instead of allocating on an initial draw request.
+// A bind spanning two chunks still reads the imported host pool; this is deliberately not Vulkan sparse binding.
 //
-// [nvn] pool_mirror = on (default) | off.
-constexpr uint64_t kChunkBytes = 64ull << 20;
+// [nvn] pool_mirror = on (default) | off; pool_mirror_chunk_mb = 64 (2, 4, 8, 16, 32 or 64).
 struct Mirror {
-    std::vector<gfx::Buffer> chunks;    // the copy, kChunkBytes each (the last one may be shorter); empty until a draw wants a page in it
+    std::vector<gfx::Buffer> chunks;    // the copy, configurable-size chunks (the last one may be shorter); allocated when copying a page
     PoolGpu* pg = nullptr;              // the pool (the copies read its chunk imports, mirror_src)
     mem::ww::Region* ww = nullptr;      // the CPU's writes to the pool's pages
     uint64_t npages = 0;
@@ -965,6 +965,25 @@ namespace {
 
 enum class MirrorMode { Off, On };
 constexpr uint64_t kPageBytes = 4096;
+
+// Native-inspired fine-grained residency: small, demand-allocated device-local chunks. Unlike Vulkan
+// sparse buffers these are separate buffers, so a draw crossing a chunk boundary falls back to the host
+// pool. The default 64 MiB path stays unchanged; use 2/4/8/16/32 for controlled A/B tests.
+uint64_t mirror_chunk_bytes() {
+    static const uint64_t bytes = [] {
+        const int64_t mb = config_get_int("nvn", "pool_mirror_chunk_mb", 64);
+        if (mb < 2 || mb > 64 || (mb & (mb - 1)) != 0) {
+            NXLOG_W(kTag, "[nvn] pool_mirror_chunk_mb = %lld is invalid (use 2, 4, 8, 16, 32 or 64); using 64 MiB",
+                    static_cast<long long>(mb));
+            return uint64_t{64} << 20;
+        }
+        NXLOG_I(kTag, "pool mirror chunk size: %lld MiB (%s, allocated on first copy)",
+                static_cast<long long>(mb), mb == 64 ? "default" : "experimental");
+        return static_cast<uint64_t>(mb) << 20;
+    }();
+    return bytes;
+}
+
 constexpr uint64_t kMaxBindPages = (64ull << 20) / kPageBytes;      // a binding over more than 64 MiB stays in the pool
 constexpr uint64_t kCopyBudget = 64ull << 20;                        // bytes copied per submission at most (an area load can want hundreds of MiB)
 constexpr uint8_t kHotHits = 2;                                      // two copies in a row overwritten before any draw read them: the page is hot ...
@@ -1087,7 +1106,7 @@ Mirror* mirror_for(PoolGpu* pg, MemoryPool* mp) {
                 static_cast<void*>(pg->base), static_cast<unsigned long long>(pg->size >> 10));
         return nullptr;
     }
-    m->chunks.resize(static_cast<size_t>((pg->size + kChunkBytes - 1) / kChunkBytes));
+    m->chunks.resize(static_cast<size_t>((pg->size + mirror_chunk_bytes() - 1) / mirror_chunk_bytes()));
     m->pg = pg;
     m->pool_flags = mp->flags;
     m->npages = pg->size / kPageBytes;
@@ -1213,12 +1232,12 @@ bool mirror_enabled() { return mirror_mode() != MirrorMode::Off; }
 
 // The chunk of the copy that holds page `page`, made now if it is not yet (null: over the budget or out of video memory).
 VkBuffer mirror_chunk(Mirror& m, uint64_t page) {
-    const size_t ci = static_cast<size_t>(page * kPageBytes / kChunkBytes);
+    const size_t ci = static_cast<size_t>(page * kPageBytes / mirror_chunk_bytes());
     if (ci >= m.chunks.size()) return VK_NULL_HANDLE;
     gfx::Buffer& c = m.chunks[ci];
     if (c.buffer) return c.buffer;
     const uint64_t budget = mirror_cap_bytes();
-    const uint64_t bytes = std::min<uint64_t>(kChunkBytes, m.pool_bytes - ci * kChunkBytes);
+    const uint64_t bytes = std::min<uint64_t>(mirror_chunk_bytes(), m.pool_bytes - ci * mirror_chunk_bytes());
     if (g_mirror_bytes + bytes > budget) {
         static bool logged = false;
         if (!logged) { logged = true; NXLOG_I(kTag, "pool copies: the budget is used up (%llu MiB): further chunks stay in the pools", static_cast<unsigned long long>(g_mirror_bytes >> 20)); }
@@ -1242,7 +1261,7 @@ VkBuffer mirror_chunk(Mirror& m, uint64_t page) {
 }
 
 // The pool import the copies of mirror chunk `page` belongs to read from (imported now if it is not yet), and in *base the pool offset of its
-// byte 0. A mirror chunk lies wholly in one import chunk: import strides are multiples of kChunkBytes. Null: the pool part cannot be imported.
+// byte 0. A mirror chunk lies wholly in one import chunk: import strides are multiples of mirror_chunk_bytes(). Null: the pool part cannot be imported.
 VkBuffer mirror_src(Mirror& m, uint64_t page, uint64_t* base) {
     const PoolChunk* c = pool_chunk(m.pg, page * kPageBytes / m.pg->stride);
     if (!c) return VK_NULL_HANDLE;
@@ -1254,21 +1273,25 @@ VkBuffer mirror_src(Mirror& m, uint64_t page, uint64_t* base) {
 // chunk's buffer, the offset in it and the bytes to its end. 0 when there is one, else why not (1 too many pages, 2 no mirror or past its
 // end, 3 across chunks, 4 no chunk buffer). resolve_read and mirror_span share it.
 struct MirrorWindow { Mirror* m = nullptr; uint64_t first = 0, last = 0; VkBuffer chunk = VK_NULL_HANDLE; uint64_t offset = 0, avail = 0; };
-static int mirror_window(PoolGpu* pg, MemoryPool* mp, uint64_t poff, uint64_t size, MirrorWindow* w) {
+static int mirror_window(PoolGpu* pg, MemoryPool* mp, uint64_t poff, uint64_t size, MirrorWindow* w, bool allocate = true) {
     const uint64_t first = poff / kPageBytes, last = (poff + size - 1) / kPageBytes;
     if (last - first + 1 > kMaxBindPages) return 1;
     Mirror* m = mirror_for(pg, mp);
     if (!m || last >= m->npages) return 2;
-    const uint64_t chunk_pages = kChunkBytes / kPageBytes;
+    const uint64_t chunk_pages = mirror_chunk_bytes() / kPageBytes;
     if (first / chunk_pages != last / chunk_pages) return 3;
-    const VkBuffer cb = mirror_chunk(*m, first);
-    if (!cb) return 4;
+    const size_t ci = static_cast<size_t>(first / chunk_pages);
+    const uint64_t bytes = std::min<uint64_t>(mirror_chunk_bytes(), m->pool_bytes - ci * mirror_chunk_bytes());
+    // Draw requests only mark invalid pages as wanted. Allocate the destination at the following
+    // submission's copy, not on every first bind (which may target hot/never-copied pages).
+    const VkBuffer cb = allocate ? mirror_chunk(*m, first) : m->chunks[ci].buffer;
+    if (!cb && (allocate || g_mirror_bytes + bytes > mirror_cap_bytes())) return 4;
     w->m = m;
     w->first = first;
     w->last = last;
     w->chunk = cb;
-    w->offset = poff - (first / chunk_pages) * kChunkBytes;
-    w->avail = std::min<uint64_t>(kChunkBytes, m->pool_bytes - (first / chunk_pages) * kChunkBytes) - w->offset;
+    w->offset = poff - (first / chunk_pages) * mirror_chunk_bytes();
+    w->avail = std::min<uint64_t>(mirror_chunk_bytes(), m->pool_bytes - (first / chunk_pages) * mirror_chunk_bytes()) - w->offset;
     return 0;
 }
 
@@ -1280,10 +1303,10 @@ BufRef resolve_read(uint64_t gpu_address, uint64_t size, int use) {
     if (!g_mirror_on) return out;
     if (!out.ok || !pg || !size) { g_use_skip[use % 3]++; g_skip_why[0]++; return out; }
     MirrorWindow w;
-    if (const int why = mirror_window(pg, mp, poff, size, &w)) { g_use_skip[use % 3]++; g_skip_why[why]++; return out; }
+    if (const int why = mirror_window(pg, mp, poff, size, &w, false)) { g_use_skip[use % 3]++; g_skip_why[why]++; return out; }
     Mirror* m = w.m;
     const uint64_t first = w.first, last = w.last;
-    if (range_valid(*m, first, last - first + 1) || (out_lazy() && new_servable(*m, first, last))) {
+    if (w.chunk && (range_valid(*m, first, last - first + 1) || (out_lazy() && new_servable(*m, first, last)))) {
         out.buffer = w.chunk;
         out.offset = w.offset;
         out.avail = w.avail;
@@ -1348,7 +1371,7 @@ bool mirror_fill(VkCommandBuffer cb, uint64_t gpu_address, uint64_t size, uint64
     if (!out.ok || !pg || !pg->mirror) return false;
     Mirror& m = *pg->mirror;
     const uint64_t first = poff / kPageBytes, last = (poff + size - 1) / kPageBytes;
-    const uint64_t chunk_pages = kChunkBytes / kPageBytes;
+    const uint64_t chunk_pages = mirror_chunk_bytes() / kPageBytes;
     if (last >= m.npages || last - first + 1 > kMaxBindPages || first / chunk_pages != last / chunk_pages) return false;
     const VkBuffer chunk = mirror_chunk(m, first);
     if (!chunk) return false;
@@ -1360,7 +1383,7 @@ bool mirror_fill(VkCommandBuffer cb, uint64_t gpu_address, uint64_t size, uint64
         if (!page_valid(m, p) && (m.hot_until[static_cast<size_t>(p)] > now || mem::ww::page_banned(m.ww, p))) return false;
     static std::vector<VkBufferCopy> copies;
     copies.clear();
-    const uint64_t base = (first / chunk_pages) * kChunkBytes;
+    const uint64_t base = (first / chunk_pages) * mirror_chunk_bytes();
     bool ok = true;
     for (uint64_t p = first; p <= last;) {
         if (page_valid(m, p) || new_get(m, p)) { ++p; continue; }
@@ -1442,7 +1465,7 @@ void mirror_begin_submit(Frame& f, bool on) {
                 m.want_hi = std::max(m.want_hi, p_end - 1);
                 break;
             }
-            const uint64_t chunk_pages = kChunkBytes / kPageBytes;
+            const uint64_t chunk_pages = mirror_chunk_bytes() / kPageBytes;
             const uint64_t chunk_end = (p / chunk_pages + 1) * chunk_pages;
             uint64_t src_base = 0;
             if (!mirror_chunk(m, p) || !mirror_src(m, p, &src_base)) { bit_put(m.want, p, false); ++p; continue; }
@@ -1456,7 +1479,7 @@ void mirror_begin_submit(Frame& f, bool on) {
                 bit_put(m.used, i, false);
             }
             if (armed) {
-                const uint64_t base = (p / chunk_pages) * kChunkBytes;
+                const uint64_t base = (p / chunk_pages) * mirror_chunk_bytes();
                 g_copy_tmp.push_back(VkBufferCopy{p * kPageBytes, p * kPageBytes - base, (q - p) * kPageBytes});
                 budget -= (q - p) * kPageBytes;
                 m.st_copied += static_cast<int64_t>(q - p);
@@ -1472,9 +1495,9 @@ void mirror_begin_submit(Frame& f, bool on) {
         // the source is the pool's own buffer: the copy reads what the CPU and earlier GPU work left in the pages. The runs are in pool
         // order and never span two chunks: one copy command per chunk.
         for (size_t i = 0; i < g_copy_tmp.size();) {
-            const size_t ci = static_cast<size_t>(g_copy_tmp[i].srcOffset / kChunkBytes);
+            const size_t ci = static_cast<size_t>(g_copy_tmp[i].srcOffset / mirror_chunk_bytes());
             size_t j = i + 1;
-            while (j < g_copy_tmp.size() && g_copy_tmp[j].srcOffset / kChunkBytes == ci) ++j;
+            while (j < g_copy_tmp.size() && g_copy_tmp[j].srcOffset / mirror_chunk_bytes() == ci) ++j;
             uint64_t src_base = 0;
             const VkBuffer src = mirror_src(m, g_copy_tmp[i].srcOffset / kPageBytes, &src_base);   // imported when the run was made
             for (size_t k = i; k < j; ++k) g_copy_tmp[k].srcOffset -= src_base;
@@ -1740,7 +1763,7 @@ bool out_servable(uint64_t addr, uint64_t size) {
     if (!r.ok || !pg || !pg->mirror) return false;
     const Mirror& m = *pg->mirror;
     const uint64_t first = poff / kPageBytes, last = (poff + size - 1) / kPageBytes;
-    const uint64_t chunk_pages = kChunkBytes / kPageBytes;
+    const uint64_t chunk_pages = mirror_chunk_bytes() / kPageBytes;
     if (last >= m.npages || last - first + 1 > kMaxBindPages || first / chunk_pages != last / chunk_pages) return false;
     if (!m.chunks[static_cast<size_t>(first / chunk_pages)].buffer) return false;
     return range_valid(m, first, last - first + 1) || new_servable(m, first, last);

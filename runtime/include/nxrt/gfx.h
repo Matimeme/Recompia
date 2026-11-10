@@ -68,7 +68,9 @@ struct ValidationStats {
 
 // host-visible memory is mapped persistently. Shadow: [nvn] pool_copy's copies of pool cells: host-visible + coherent (host-cached
 // preferred), random host access both ways (the CPU copies guest bytes in and GPU results out), the GPU reads it in place.
-enum class MemoryUse { GpuOnly, Upload, Readback, Shadow };
+// ShadowLocal: experimental ReBAR path, requiring HOST_VISIBLE | HOST_COHERENT | DEVICE_LOCAL mapped VRAM instead of system RAM;
+// it may be write-combined, so CPU reads and repeated page copies can be slow. Never used without an explicit opt-in.
+enum class MemoryUse { GpuOnly, Upload, Readback, Shadow, ShadowLocal };
 
 struct ImageDesc {
     VkImageType type = VK_IMAGE_TYPE_2D;

@@ -83,6 +83,7 @@ bool auto_copy() {
 struct Cfg {
     bool automatic = true;
     bool on = false;
+    bool rebar = false;    // experimental: place mapped shadows in coherent device-local VRAM
     std::string mode;
     uint64_t cell = 16ull << 20;
     uint32_t idle = 600;
@@ -95,6 +96,7 @@ const Cfg& cfg() {
         r.mode = config_get_str("nvn", "pool_copy", "auto");
         r.automatic = r.mode == "auto";
         r.on = !r.automatic && (r.mode == "on" || r.mode == "1" || r.mode == "true");
+        r.rebar = config_get_bool("nvn", "pool_copy_rebar", false);
         r.cell = static_cast<uint64_t>(std::clamp<int64_t>(config_get_int("nvn", "pool_copy_cell_mb", 16), 1, 1024)) << 20;
         r.idle = static_cast<uint32_t>(std::clamp<int64_t>(config_get_int("nvn", "pool_copy_idle", 600), 0, 1 << 30));
         r.cap = static_cast<uint64_t>(std::max<int64_t>(0, config_get_int("nvn", "pool_copy_mb", 1536))) << 20;
@@ -108,10 +110,12 @@ void log_cfg(const Cfg& c, bool on) {
     std::call_once(once, [&] {
         const char* why = !c.automatic ? "" : (host_is_wine() ? ", Wine" : (on ? ", integrated GPU with at most 8 GiB of device-local memory" : ", not Wine or a small integrated GPU"));
         NXLOG_I(kTag, "pool_copy %s (%s%s)", on ? "on" : "off", c.mode.c_str(), why);
-        if (on)
+        if (on) {
             NXLOG_I(kTag, "pool_copy: shadows in cells of %llu MiB, dropped after %u idle presents, cap %llu MiB; pool_lazy, pool_lazy_chunk_mb, "
                           "pool_lazy_idle, pool_lazy_cpu_untile and compute_out_lazy are ignored",
                     static_cast<unsigned long long>(c.cell >> 20), c.idle, static_cast<unsigned long long>(c.cap >> 20));
+            NXLOG_I(kTag, "pool_copy: shadow placement %s", c.rebar ? "experimental ReBAR VRAM (system fallback on allocation failure)" : "host memory");
+        }
     });
 }
 
@@ -293,7 +297,21 @@ bool pcopy_alloc(PoolGpu* g, PoolChunk& c, uint64_t off, uint64_t size, const ch
         }
     }
     gfx::Buffer b;
-    if (device().create_buffer(size, shadow_usage(), gfx::MemoryUse::Shadow, &b, "nvn pool shadow") != VK_SUCCESS || !b.mapped) {
+    VkResult alloc = device().create_buffer(size, shadow_usage(),
+                                            cfg().rebar ? gfx::MemoryUse::ShadowLocal : gfx::MemoryUse::Shadow,
+                                            &b, cfg().rebar ? "nvn pool ReBAR shadow" : "nvn pool shadow");
+    if (cfg().rebar && (alloc != VK_SUCCESS || !b.mapped)) {
+        // ReBAR may expose a host-visible local memory type but not have enough VRAM budget
+        // for another mapped cell. A regular system shadow is safer than binding a dummy
+        // buffer; it also makes the fallback explicit in the log.
+        if (b.buffer) device().destroy_buffer(b);
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            NXLOG_W(kTag, "pool_copy: mapped ReBAR VRAM is unavailable or exhausted (VkResult %d); falling back to host-visible system shadows",
+                    static_cast<int>(alloc));
+        alloc = device().create_buffer(size, shadow_usage(), gfx::MemoryUse::Shadow, &b, "nvn pool system shadow fallback");
+    }
+    if (alloc != VK_SUCCESS || !b.mapped) {
         if (b.buffer) device().destroy_buffer(b);
         g_fallback.fetch_add(1, std::memory_order_relaxed);
         static bool warned = false;

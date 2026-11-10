@@ -10,6 +10,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -259,6 +260,36 @@ bool import_range(PoolGpu* g, PoolChunk& c, uint64_t off, uint64_t size, const c
     }
     uint32_t ty = 0;
     while (!(hp.memoryTypeBits & (1u << ty))) ++ty;
+    // Diagnostic only: importing a host pointer does not move the backing allocation into VRAM.
+    // On ReBAR hardware, distinguish the types that Vulkan actually permits for this import
+    // from host-visible + device-local memory types that may exist elsewhere on the device.
+    if (config_get_bool("nvn", "pool_import_memory_diag", false)) {
+        static std::atomic<uint32_t> reported_types{0};
+        const uint32_t type_bit = 1u << ty;
+        if ((reported_types.fetch_or(type_bit, std::memory_order_relaxed) & type_bit) == 0) {
+            VkPhysicalDeviceMemoryProperties props{};
+            vkGetPhysicalDeviceMemoryProperties(dev.physical(), &props);
+            const auto& mt = props.memoryTypes[ty];
+            const auto& heap = props.memoryHeaps[mt.heapIndex];
+            bool compatible_local_visible = false;
+            bool any_local_visible = false;
+            for (uint32_t i = 0; i < props.memoryTypeCount; ++i) {
+                const VkMemoryPropertyFlags f = props.memoryTypes[i].propertyFlags;
+                const bool local_visible = (f & (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) ==
+                                            (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+                if (local_visible) {
+                    any_local_visible = true;
+                    if (hp.memoryTypeBits & (1u << i)) compatible_local_visible = true;
+                }
+            }
+            NXLOG_I(kTag, "host import memory type %u: flags=0x%x heap=%u heap_flags=0x%x heap_size=%llu MiB; "
+                     "compatible_types=0x%x compatible_device_local_host_visible=%s any_device_local_host_visible=%s "
+                     "(host pointer remains system-backed)",
+                     ty, static_cast<unsigned>(mt.propertyFlags), mt.heapIndex,
+                     static_cast<unsigned>(heap.flags), static_cast<unsigned long long>(heap.size >> 20),
+                     hp.memoryTypeBits, compatible_local_visible ? "yes" : "no", any_local_visible ? "yes" : "no");
+        }
+    }
     VkImportMemoryHostPointerInfoEXT imp = {VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
     imp.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
     imp.pHostPointer = import_ptr;

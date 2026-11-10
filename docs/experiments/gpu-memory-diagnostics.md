@@ -43,3 +43,40 @@ This adds one opt-in log message per *selected* imported Vulkan memory type. It 
 ## Next investigation
 
 Check log results and frame times before considering small, guarded modifications to mirror residency/copy policy. Always retain an unmodified build for A/B testing.
+
+
+## Experimental on-demand mirrors (branch `experiment/native-style-on-demand-mirrors`)
+
+This branch adapts **two limited ideas** from Pokopia Native's Vulkan memory system:
+- Small, independently backed device-local buffer chunks (2, 4, 8, 16, 32 or 64 MiB).
+- For vertex/index/uniform draw bindings, postpone the first chunk allocation until a later submission actually copies requested pages, instead of allocating on the first request even when no copy follows.
+
+It **does not** implement Native's `VK_BUFFER_CREATE_SPARSE_BINDING_BIT` / `vkQueueBindSparse` path. Recompia still imports the original CPU-backed pool via `VK_EXT_external_memory_host`, and a draw whose binding crosses a chunk boundary still reads from that host pool. Smaller chunks can increase fallback reads across PCIe, Vulkan object counts, and driver overhead.
+
+### Comparison commands (Windows)
+
+Launch from the directory containing `PokopiaLauncher.exe` and `pkp.exe` in **each** test, preserving exactly the same scene, texture quality, render resolution, FPS limiter and driver configuration. Do not overwrite a working installation.
+
+**Baseline: 64 MiB chunks (original granularity):**
+
+```bat
+cd /d C:\PokopiaRecomp-0.0.0
+set NXRT_NVN_POOL_MIRROR_MB=
+set NXRT_NVN_POOL_MIRROR_CHUNK_MB=64
+PokopiaLauncher.exe
+```
+
+**Experimental: 2 MiB chunks (Native-inspired granularity):**
+
+```bat
+cd /d C:\PokopiaRecomp-0.0.0
+set NXRT_NVN_POOL_MIRROR_MB=
+set NXRT_NVN_POOL_MIRROR_CHUNK_MB=2
+PokopiaLauncher.exe
+```
+
+`NXRT_NVN_POOL_MIRROR_MB=` removes a previous environment override for that CMD session; remove `pool_mirror_mb` from `nxrt.ini` as well if you set it there. Leave Faster GPU Memory **on**.
+
+Confirm the selected size by finding `nvn.pool: pool mirror chunk size: 2 MiB` in `pkp.log`; find `pool mirrors:` for allocation totals. Measure **per-process** dedicated and shared GPU memory for `pkp.exe` in Windows Task Manager, average FPS, 1% low, and longest hitch, ideally after the same load and in the same location.
+
+**Caveat:** This branch is a first-stage experiment in a long-term switch to Native-style sparse residency; it does not yet reduce host-memory imports or promise lower total GPU memory in Windows. Keep the existing 64 MiB path if small chunks substantially hurt FPS.
